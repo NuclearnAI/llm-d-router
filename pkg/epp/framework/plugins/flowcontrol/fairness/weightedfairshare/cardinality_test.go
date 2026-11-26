@@ -71,3 +71,18 @@ func TestFlowGauges_ZeroLimitFoldsWeightedIDs(t *testing.T) {
 
 	assert.Equal(t, 0, testutil.CollectAndCount(p.weightGauge))
 }
+
+// An ID the operator gave a ceiling keeps its rate series past the cap, as a
+// weighted ID does. No other test pins rated-past-cap.
+func TestRateGauges_RateLimitedIDsKeepSeriesPastLimit(t *testing.T) {
+	t.Cleanup(func() { metricsutil.SetFairnessIDLabelLimit(metricsutil.DefaultFairnessIDLabelLimit) })
+
+	p := newPolicy(t, `{"flowRates":{"rated-past-cap":{"rate":5}}}`)
+	metricsutil.SetFairnessIDLabelLimit(1)
+	for _, id := range []string{"first", "second", "rated-past-cap"} {
+		complete(p, id, 0, 100, 0)
+	}
+
+	assert.Equal(t, 2, testutil.CollectAndCount(p.costCounter), "first and rated-past-cap; second is past the cap")
+	assert.Equal(t, 5.0, testutil.ToFloat64(p.rateGauge.WithLabelValues("rated-past-cap")))
+}

@@ -40,8 +40,11 @@ Both teams send more requests than the pool can serve, so requests queue in the 
 **Cost**, defined by the configured cost function:
 
 ```
-cost = costPerRequest + costPerInputToken * promptTokens + costPerOutputToken * completionTokens
+cost = costPerRequest + costPerInputToken * uncachedPromptTokens
+     + costPerCachedInputToken * cachedPromptTokens + costPerOutputToken * completionTokens
 ```
+
+`cachedPromptTokens` is `usage.prompt_tokens_details.cached_tokens` (vLLM reports it with `--enable-prompt-tokens-details`). `costPerCachedInputToken` defaults to `costPerInputToken`, which charges every prompt token alike.
 
 `completionTokens` is the output token count used for charging, as described in [Inputs consumed](#inputs-consumed). Server-reported completion tokens include reasoning (thinking) tokens, which are charged at `costPerOutputToken` like any other output.
 
@@ -57,7 +60,8 @@ The default `0 / 1 / 2` weights an output token at twice an input token. The coe
 *   **Minimum virtual service**: Reads and advances the minimum virtual service stored on the priority band, which a flow returning from idle is raised to.
 *   **Request headers**: `x-llm-d-inference-fairness-id` only, which supplies the flow id and falls back to a single default id when absent. No weight is read from the request.
 *   **Policy configuration**: the `flowWeights` table and `defaultFlowWeight`, which together resolve every flow's weight.
-*   **Response usage**: `PromptTokens` and `CompletionTokens` from `Response.Usage` at stream completion. A streaming response carries usage only if the request set `stream_options.include_usage`, or the model server forces it (vLLM: `--enable-force-include-usage`). Positive `CompletionTokens` supplies the output token count. Otherwise, positive `Response.StreamedEvents` is used as an output-token estimate, and a missing `PromptTokens` is replaced by the tokenized prompt count. This fallback also applies to streams cut short by a disconnect or error. If neither usage nor observed events are available, only `costPerRequest` is charged.
+*   **Request size and output cap**: for rate-limited flows only, `InferenceRequest.RequestSizeBytes` and `InferenceRequestBody.MaxOutputTokens`, which size the dispatch estimate.
+*   **Response usage**: `PromptTokens`, `CompletionTokens` and `PromptTokenDetails.CachedTokens` from `Response.Usage` at stream completion. A streaming response carries usage only if the request set `stream_options.include_usage`, or the model server forces it (vLLM: `--enable-force-include-usage`). Positive `CompletionTokens` supplies the output token count. Otherwise, positive `Response.StreamedEvents` is used as an output-token estimate, and a missing `PromptTokens` is replaced by the tokenized prompt count. This fallback also applies to streams cut short by a disconnect or error. If neither usage nor observed events are available, only `costPerRequest` is charged.
 *   **Tokenized prompt**: the prompt token count the token producer stores on `InferenceRequestBody.TokenizedRequest`, read only for a stream without usage. With the token producer's `vllm` backend it is the model server's own tokenization; the default `estimate` backend packs 4 bytes of message text into each token and counts no chat-template tokens, so the prompt charge is approximate. The token producer runs after flow control, so this policy cannot request one. A token producer runs when another plugin consumes `TokenizedPrompt`, for example `prefix-cache-scorer` (through `approx-prefix-cache-producer`) or `inflight-load-producer`. Without one, a stream without usage is charged no prompt tokens.
 
 ## Configuration
@@ -83,10 +87,38 @@ The default `0 / 1 / 2` weights an output token at twice an input token. The coe
 | `costPerRequest` | `0` | Flat cost charged per completed request. |
 | `costPerInputToken` | `1` | Cost per prompt token. |
 | `costPerOutputToken` | `2` | Cost per completion token. |
+| `costPerCachedInputToken` | `costPerInputToken` | Cost per prompt token the model server reports as a prefix-cache hit. |
+| `flowRates` | `{}` | Ceiling per fairness ID: `rate` in cost per second and `burst` in cost. `burst` defaults to 10 seconds of `rate`. See [Rate ceilings](#rate-ceilings). Each entry adds one metric label value, as for `flowWeights`. |
+| `defaultFlowRate` | none | Ceiling for any fairness ID absent from `flowRates`, including the default tenant. |
+| `initialOutputTokens` | `256` | Output tokens assumed for a rate-limited flow's requests until one completes. |
+| `bytesPerInputToken` | `4` | Request bytes per prompt token assumed until a rate-limited flow's first request completes. |
+| `pendingTtlSeconds` | `3600` | How long a dispatch estimate waits for its request's end of stream before it is dropped and stays charged. |
+| `maxHoldSeconds` | `0` | Longest a ceiling holds a request before it dispatches regardless of the balance. `0` holds until the request TTL. Set it below the request TTL and the callers' timeouts so a ceiling never fails a request. |
 
 All three cost coefficients must be `>= 0` and not all zero. With all-zero coefficients nothing is charged and every flow's virtual service stays at zero, so that configuration is rejected at startup.
 
 A weight change takes effect for cost charged after the change. Virtual service already accumulated is not rescaled.
+
+### Rate ceilings
+
+Weights divide a band only while it is contended. `flowRates` adds a ceiling that holds whether or not the pool is saturated: each listed fairness ID gets a token bucket that refills at `rate` cost per second up to `burst`.
+
+```yaml
+  parameters:
+    costPerInputToken: 0.055      # one uncached prompt token ~ 1/18 of an output token's engine time
+    costPerCachedInputToken: 0
+    costPerOutputToken: 1          # cost unit: output-equivalent tokens
+    flowRates:
+      team-b: {rate: 300, burst: 30000}
+```
+
+*   `Pick` skips a flow whose balance is not positive. Its requests stay in their queue while other flows dispatch; when no flow in the band is eligible, the band dispatches nothing that cycle.
+*   Without `maxHoldSeconds`, a request held longer than the flow-control request TTL is rejected with `429` and `x-llm-d-request-dropped-reason: rejected-ttl-expired`. With `maxHoldSeconds` set below the TTL, a held request dispatches once it has waited that long, so the ceiling only delays requests. The balance is then floored at `-rate * maxHoldSeconds`: a request arriving at the floor waits at most `maxHoldSeconds`, and an overload leaves no debt beyond that. Under a sustained overload a flow then dispatches more than `rate`, bounded by how many requests it keeps queued.
+*   The bucket belongs to the fairness ID, so one ceiling spans every priority the ID sends at.
+*   `Pick` charges an estimate for the request it selects, and `ResponseBody` charges the difference to the actual cost at end of stream. Without the estimate a flow could dispatch any number of requests before the first one completed. The estimate is learned per fairness ID from completed requests: input cost per request byte, and output cost per request bounded by the request's `max_tokens`. A request picked again after a dispatch that did not go through is charged once. A request without a request ID is charged at end of stream only.
+*   The balance may go negative, so a request larger than `burst` dispatches once the balance is positive and the flow then waits for the refill. Over time the flow dispatches `rate`, exceeding it by at most `burst` plus one request.
+*   A ceiling does not earn fairness credit: a held flow rejoins the band at its minimum virtual service.
+*   Balances are in-memory per EPP instance. A restart or leader change starts every bucket full.
 
 ### Choosing the cost coefficients
 
@@ -108,12 +140,17 @@ On a long-context agentic corpus (ISL ~130k, OSL ~1k) input is about 98% of the 
 | --- | --- | --- |
 | `llm_d_epp_weighted_fair_share_virtual_service` | gauge | `flow_id`, `priority`, `policy` |
 | `llm_d_epp_weighted_fair_share_flow_weight` | gauge | `flow_id`, `priority`, `policy` |
+| `llm_d_epp_weighted_fair_share_charged_cost_total` | counter | `flow_id`, `policy` |
+| `llm_d_epp_weighted_fair_share_flow_rate` | gauge | `flow_id`, `policy` |
+| `llm_d_epp_weighted_fair_share_rate_balance` | gauge | `flow_id`, `policy` |
 
 Under contention the virtual-service gauges of backlogged flows in one band stay close together; a persistent gap means a flow is not receiving its share. The gauge includes any raise to the band's minimum virtual service, so it is not a cumulative cost total.
 
 The weight gauge shows the weight resolved for each flow. A fairness ID that does not match a `flowWeights` key silently takes `defaultFlowWeight`, and this gauge is how to detect that. Collectors are per-instance and registered through `handle.Metrics()`, so two instances can share one registry.
 
-Both gauges label `flow_id` with the fairness ID, so they share the `--fairness-id-metric-label-limit` cap. Flows past the cap are still scheduled and charged; they just get no series. A fairness ID named in `flowWeights` keeps its own label on these gauges and on every `fairness_id` metric after the cap fills, unless the limit is 0 or the ID is `other`, the overflow label. The match is on the whole fairness ID, as for the weight. The IDs are pinned when the policy is built, so this applies to every configured instance, whether or not a priority band references it. The EPP logs the number of pinned IDs at startup (see the metrics docs).
+`rate(llm_d_epp_weighted_fair_share_charged_cost_total[5m])` is each fairness ID's throughput in cost per second, for every flow whether or not it has a ceiling; compare it with `flow_rate`. `rate_balance` is set for rate-limited IDs only; a flow dispatches while it is positive.
+
+All of these label `flow_id` with the fairness ID, so they share the `--fairness-id-metric-label-limit` cap. Flows past the cap are still scheduled and charged; they just get no series. A fairness ID named in `flowWeights` or `flowRates` keeps its own label on these metrics and on every `fairness_id` metric after the cap fills, unless the limit is 0 or the ID is `other`, the overflow label. The match is on the whole fairness ID, as for the weight. The IDs are pinned when the policy is built, so this applies to every configured instance, whether or not a priority band references it. The EPP logs the number of pinned IDs at startup (see the metrics docs).
 
 ## Trade-offs
 
