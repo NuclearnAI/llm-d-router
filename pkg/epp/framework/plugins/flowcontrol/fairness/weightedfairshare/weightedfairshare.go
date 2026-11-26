@@ -57,22 +57,48 @@ type Config struct {
 
 	// Cost of a completed request, the quantity whose share follows the weights:
 	//
-	//	cost = CostPerRequest + CostPerInputToken*promptTokens + CostPerOutputToken*completionTokens
+	//	cost = CostPerRequest + CostPerInputToken*uncachedPromptTokens
+	//	     + CostPerCachedInputToken*cachedPromptTokens + CostPerOutputToken*completionTokens
+	//
+	// cachedPromptTokens is the model server's usage.prompt_tokens_details.cached_tokens.
 	CostPerRequest     float64 `json:"costPerRequest,omitempty"`
 	CostPerInputToken  float64 `json:"costPerInputToken,omitempty"`
 	CostPerOutputToken float64 `json:"costPerOutputToken,omitempty"`
+	// CostPerCachedInputToken defaults to CostPerInputToken when unset.
+	CostPerCachedInputToken *float64 `json:"costPerCachedInputToken,omitempty"`
+
+	// FlowRates maps fairness ID to a ceiling on cost per second; see ratelimit.go.
+	FlowRates map[string]FlowRate `json:"flowRates,omitempty"`
+	// DefaultFlowRate applies to any fairness ID absent from FlowRates. The zero value is no ceiling.
+	DefaultFlowRate FlowRate `json:"defaultFlowRate,omitempty"`
+	// InitialOutputTokens and BytesPerInputToken seed a rate-limited flow's dispatch estimate
+	// until its first request completes.
+	InitialOutputTokens float64 `json:"initialOutputTokens,omitempty"`
+	BytesPerInputToken  float64 `json:"bytesPerInputToken,omitempty"`
+	// PendingTTLSeconds bounds how long a dispatch estimate waits for its request's end of stream.
+	PendingTTLSeconds float64 `json:"pendingTtlSeconds,omitempty"`
 }
 
 // DefaultConfig returns the configuration used when no parameters are supplied.
 func DefaultConfig() Config {
 	return Config{
-		IdleTTLSeconds:     3600,
-		SweepSeconds:       300,
-		DefaultFlowWeight:  1,
-		CostPerRequest:     0,
-		CostPerInputToken:  1,
-		CostPerOutputToken: 2,
+		IdleTTLSeconds:      3600,
+		SweepSeconds:        300,
+		DefaultFlowWeight:   1,
+		CostPerRequest:      0,
+		CostPerInputToken:   1,
+		CostPerOutputToken:  2,
+		InitialOutputTokens: 256,
+		BytesPerInputToken:  4,
+		PendingTTLSeconds:   3600,
 	}
+}
+
+func (c Config) cachedInputPrice() float64 {
+	if c.CostPerCachedInputToken != nil {
+		return *c.CostPerCachedInputToken
+	}
+	return c.CostPerInputToken
 }
 
 func (c Config) validate() error {
@@ -91,13 +117,42 @@ func (c Config) validate() error {
 		return errors.New("cost coefficients cannot all be zero")
 	case c.DefaultFlowWeight <= 0:
 		return fmt.Errorf("defaultFlowWeight must be > 0, got %v", c.DefaultFlowWeight)
+	case c.CostPerCachedInputToken != nil && *c.CostPerCachedInputToken < 0:
+		return fmt.Errorf("costPerCachedInputToken must be >= 0, got %v", *c.CostPerCachedInputToken)
+	case c.InitialOutputTokens < 0:
+		return fmt.Errorf("initialOutputTokens must be >= 0, got %v", c.InitialOutputTokens)
+	case c.BytesPerInputToken <= 0:
+		return fmt.Errorf("bytesPerInputToken must be > 0, got %v", c.BytesPerInputToken)
+	case c.PendingTTLSeconds <= 0:
+		return fmt.Errorf("pendingTtlSeconds must be > 0, got %v", c.PendingTTLSeconds)
 	}
 	for id, w := range c.FlowWeights {
 		if w <= 0 {
 			return fmt.Errorf("flowWeights[%q]: weight must be > 0, got %v", id, w)
 		}
 	}
+	if err := c.DefaultFlowRate.validate("defaultFlowRate"); err != nil {
+		return err
+	}
+	for id, r := range c.FlowRates {
+		if err := r.validate(fmt.Sprintf("flowRates[%q]", id)); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// withRateDefaults fills each ceiling's unset burst.
+func (c Config) withRateDefaults() Config {
+	c.DefaultFlowRate = c.DefaultFlowRate.withDefaults()
+	if len(c.FlowRates) > 0 {
+		rates := make(map[string]FlowRate, len(c.FlowRates))
+		for id, r := range c.FlowRates {
+			rates[id] = r.withDefaults()
+		}
+		c.FlowRates = rates
+	}
+	return c
 }
 
 var (
@@ -112,12 +167,22 @@ type weightedFairShare struct {
 	// Keyed by FlowKey, so a tenant's flows at different priorities are accounted separately.
 	state sync.Map // flowcontrol.FlowKey -> *flowState
 
+	// Keyed by fairness ID: a ceiling spans every priority the ID sends at.
+	rates sync.Map // string -> *rateState
+	// Dispatch estimates awaiting end of stream, keyed by request ID.
+	pending sync.Map // string -> pendingCharge
+
 	// Unix-nano time of the last idle sweep, run from Pick.
 	lastSweep atomic.Int64
+
+	now func() time.Time
 
 	// Per-instance so that several instances can share one registry.
 	vserviceGauge *prometheus.GaugeVec
 	weightGauge   *prometheus.GaugeVec
+	rateGauge     *prometheus.GaugeVec
+	balanceGauge  *prometheus.GaugeVec
+	costCounter   *prometheus.CounterVec
 }
 
 // WeightedFairShareFairnessPolicyFactory constructs the policy from its parameters block.
@@ -138,11 +203,13 @@ func WeightedFairShareFairnessPolicyFactory(
 	if name == "" {
 		name = WeightedFairShareFairnessPolicyType
 	}
+	cfg = cfg.withRateDefaults()
 
 	vservice, weight := newCollectors(name)
+	rate, balance, cost := newRateCollectors(name)
 	if handle != nil {
 		if reg := handle.Metrics(); reg != nil {
-			for _, c := range []prometheus.Collector{vservice, weight} {
+			for _, c := range []prometheus.Collector{vservice, weight, rate, balance, cost} {
 				if err := reg.Register(c); err != nil {
 					return nil, fmt.Errorf("%s plugin %q: registering metrics: %w",
 						WeightedFairShareFairnessPolicyType, name, err)
@@ -150,7 +217,11 @@ func WeightedFairShareFairnessPolicyFactory(
 			}
 		}
 	}
-	return &weightedFairShare{name: name, cfg: cfg, vserviceGauge: vservice, weightGauge: weight}, nil
+	return &weightedFairShare{
+		name: name, cfg: cfg, now: time.Now,
+		vserviceGauge: vservice, weightGauge: weight,
+		rateGauge: rate, balanceGauge: balance, costCounter: cost,
+	}, nil
 }
 
 func (p *weightedFairShare) TypedName() fwkplugin.TypedName {
@@ -184,7 +255,7 @@ func (p *weightedFairShare) Pick(
 	minVS.mu.Lock()
 	defer minVS.mu.Unlock()
 
-	now := time.Now()
+	now := p.now()
 	var best flowcontrol.FlowQueueAccessor
 	bestVS, bestWait := math.Inf(1), time.Duration(math.MinInt64)
 
@@ -197,6 +268,11 @@ func (p *weightedFairShare) Pick(
 			return true
 		}
 		key := queue.FlowKey()
+		// A flow over its ceiling is skipped before catchUp, so it is raised to the band's
+		// minimum when it becomes eligible and earns no credit for the time it was held.
+		if !p.rateAllows(key.ID, now) {
+			return true
+		}
 		vs, raised := p.stateFor(key).catchUp(minVS.virtualService, now)
 		if raised {
 			setFlowGauge(p.vserviceGauge, key, vs)
@@ -212,6 +288,7 @@ func (p *weightedFairShare) Pick(
 	p.maybePrune(now)
 	if best != nil {
 		minVS.virtualService = max(minVS.virtualService, bestVS)
+		p.chargeEstimate(best, now)
 	}
 	return best, nil
 }
@@ -236,14 +313,26 @@ func (p *weightedFairShare) ResponseBody(
 			promptTokens = request.Body.TokenizedRequest.TokenCount()
 		}
 	}
-	cost := p.cfg.CostPerRequest +
-		p.cfg.CostPerInputToken*float64(promptTokens) +
-		p.cfg.CostPerOutputToken*float64(completionTokens)
+	cachedTokens := 0
+	if details := response.Usage.PromptTokenDetails; details != nil {
+		cachedTokens = min(max(details.CachedTokens, 0), max(promptTokens, 0))
+	}
+	inputCost := p.cfg.CostPerInputToken*float64(promptTokens-cachedTokens) +
+		p.cfg.cachedInputPrice()*float64(cachedTokens)
+	outputCost := p.cfg.CostPerOutputToken * float64(completionTokens)
+	cost := p.cfg.CostPerRequest + inputCost + outputCost
+
+	id := fairnessIDFor(request)
+	now := p.now()
+	p.settleRate(id, request, inputCost, outputCost, cost, now)
 	if cost == 0 {
 		return
 	}
-	key := flowcontrol.FlowKey{ID: fairnessIDFor(request), Priority: request.Objectives.Priority}
-	vs := p.stateFor(key).charge(cost/p.weightFor(key), time.Now())
+	if label, overflow := metricsutil.BoundFairnessIDWithOverflow(id); !overflow {
+		p.costCounter.WithLabelValues(label).Add(cost)
+	}
+	key := flowcontrol.FlowKey{ID: id, Priority: request.Objectives.Priority}
+	vs := p.stateFor(key).charge(cost/p.weightFor(key), now)
 	setFlowGauge(p.vserviceGauge, key, vs)
 }
 
@@ -311,9 +400,6 @@ func (p *weightedFairShare) weightFor(key flowcontrol.FlowKey) float64 {
 
 // maybePrune runs an idle sweep at most once per sweepSeconds.
 func (p *weightedFairShare) maybePrune(now time.Time) {
-	if p.cfg.IdleTTLSeconds <= 0 {
-		return
-	}
 	interval := int64(p.cfg.SweepSeconds * float64(time.Second))
 	last := p.lastSweep.Load()
 	if last != 0 && now.UnixNano()-last < interval {
@@ -322,7 +408,12 @@ func (p *weightedFairShare) maybePrune(now time.Time) {
 	if !p.lastSweep.CompareAndSwap(last, now.UnixNano()) {
 		return // another caller owns this interval
 	}
+	p.prunePending(now)
+	if p.cfg.IdleTTLSeconds <= 0 {
+		return
+	}
 	p.prune(now)
+	p.pruneRates(now)
 }
 
 // prune drops flows untouched for longer than the idle TTL, with their metric series.
@@ -378,4 +469,34 @@ func newCollectors(name string) (vservice, weight *prometheus.GaugeVec) {
 		ConstLabels: labels,
 	}, []string{"flow_id", "priority"})
 	return vservice, weight
+}
+
+func newRateCollectors(name string) (rate, balance *prometheus.GaugeVec, cost *prometheus.CounterVec) {
+	labels := prometheus.Labels{"policy": name}
+	rate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem:   eppmetrics.LLMDRouterEndpointPickerSubsystem,
+		Name:        "weighted_fair_share_flow_rate",
+		Help:        metricsutil.HelpMsgWithStability("Ceiling resolved for a rate-limited fairness ID, in cost per second.", compbasemetrics.ALPHA),
+		ConstLabels: labels,
+	}, []string{"flow_id"})
+	balance = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem:   eppmetrics.LLMDRouterEndpointPickerSubsystem,
+		Name:        "weighted_fair_share_rate_balance",
+		Help:        metricsutil.HelpMsgWithStability("Token-bucket balance of a rate-limited fairness ID, in cost; the ID dispatches only while it is positive.", compbasemetrics.ALPHA),
+		ConstLabels: labels,
+	}, []string{"flow_id"})
+	cost = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem:   eppmetrics.LLMDRouterEndpointPickerSubsystem,
+		Name:        "weighted_fair_share_charged_cost_total",
+		Help:        metricsutil.HelpMsgWithStability("Cost charged to a fairness ID at end of stream.", compbasemetrics.ALPHA),
+		ConstLabels: labels,
+	}, []string{"flow_id"})
+	return rate, balance, cost
+}
+
+// setIDGauge sets a per-fairness-ID gauge under the shared fairness-ID label cap.
+func setIDGauge(vec *prometheus.GaugeVec, id string, v float64) {
+	if label, overflow := metricsutil.BoundFairnessIDWithOverflow(id); !overflow {
+		vec.WithLabelValues(label).Set(v)
+	}
 }
