@@ -40,6 +40,7 @@ import (
 	apixv1 "github.com/llm-d/llm-d-router/apix/v1"
 	"github.com/llm-d/llm-d-router/apix/v1alpha2"
 	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
+	"github.com/llm-d/llm-d-router/pkg/common/grpc/grpcframe"
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
@@ -243,6 +244,9 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 	if err := d.modelRewriteIfNeeded(ctx, reqCtx, inferenceRequestBody); err != nil {
 		return reqCtx, err
 	}
+	// Before any DataProducer runs, so the payload is not written while a
+	// timed-out producer can still read it.
+	d.streamUsageRequestIfNeeded(reqCtx, inferenceRequestBody)
 
 	infObjective := d.getInferenceObjective(ctx, reqCtx)
 	priority := int(*infObjective.Spec.Priority)
@@ -409,6 +413,10 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 		logger.Error(err, "failed to prepare per request data")
 	}
 
+	// A producer timeout can detach the scheduling headers. Keep forwarding
+	// pointed at the map that PreRequest will update.
+	reqCtx.Request.Headers = reqCtx.SchedulingRequest.Headers
+
 	// Run admit request plugins
 	if denier, denyReason := d.runAdmissionPlugins(ctx, reqCtx.SchedulingRequest, snapshotOfCandidatePods); denyReason != nil {
 		// Preserve a typed errcommon.Error from the denying Admitter so the
@@ -509,6 +517,30 @@ func (d *Director) modelRewriteIfNeeded(ctx context.Context, reqCtx *handlers.Re
 	inferenceRequestBody.Payload = rewritten
 	inferenceRequestBody.Mutated = true
 	return nil
+}
+
+// streamUsageRequestIfNeeded asks for usage in a streamed response whose client
+// did not ask for it, when requestHandler.requestStreamUsage is enabled, and
+// marks the request so the usage-only frame is removed from the response.
+func (d *Director) streamUsageRequestIfNeeded(reqCtx *handlers.RequestContext, inferenceRequestBody *fwkrequest.InferenceRequestBody) {
+	if !d.requestControlPlugins.requestStreamUsage {
+		return
+	}
+	requester, ok := reqCtx.Parser.(fwkrh.StreamUsageRequester)
+	if !ok {
+		return
+	}
+	payload, ok := inferenceRequestBody.Payload.(fwkrequest.MarshalablePayload)
+	if !ok {
+		return
+	}
+	requested, changed := requester.RequestStreamUsage(fwkrequest.GetRequestPath(reqCtx.Request.Headers), payload)
+	if !changed {
+		return
+	}
+	inferenceRequestBody.Payload = requested
+	inferenceRequestBody.Mutated = true
+	reqCtx.StreamUsageRequested = true
 }
 
 func (d *Director) priorityRewriteIfNeeded(ctx context.Context, reqCtx *handlers.RequestContext, inferenceRequestBody *fwkrequest.InferenceRequestBody) error {
@@ -814,6 +846,7 @@ func (d *Director) HandleResponseBody(ctx context.Context, reqCtx *handlers.Requ
 	response := &fwkrh.Response{
 		RequestID:      reqCtx.Request.ID,
 		Headers:        reqCtx.Response.Headers,
+		ReqMetadata:    reqCtx.Request.Metadata,
 		StartOfStream:  startOfStream,
 		EndOfStream:    endOfStream,
 		Usage:          reqCtx.Usage,
@@ -836,6 +869,18 @@ func (d *Director) HandleResponseBody(ctx context.Context, reqCtx *handlers.Requ
 			requests = q.requests
 		} else {
 			requests = d.scopeResponseStreamingPlugins(ctx, reqCtx.SchedulingRequest)
+		}
+		// A gRPC response's final status arrives in trailers, after the headers
+		// were already reported to the plugins. Write it onto the response
+		// headers here, once the async queue has drained, so the plugins that
+		// classify a response by its status see the final one. The header
+		// response to Envoy is already built, so the write cannot reach the
+		// client.
+		if reqCtx.ResponseGRPCStatus != "" {
+			if response.Headers == nil {
+				response.Headers = map[string]string{}
+			}
+			response.Headers[grpcframe.HeaderStatus] = reqCtx.ResponseGRPCStatus
 		}
 		// Run the final chunk synchronously so DynamicMetadata is available for the response.
 		d.runResponseBodyPlugins(ctx, requests, response, reqCtx.TargetPod)

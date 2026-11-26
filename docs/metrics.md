@@ -112,6 +112,12 @@ enabled and a request carries both, has a cap that defaults to 1000 distinct val
 apply over the lifetime of the process. Once a cap is reached, new values are reported as `other`.
 A value longer than 256 bytes, or one that is not valid UTF-8, is always reported as `other`.
 `default-flow`, the ID given to requests that have none, keeps its own label unless the limit is 0.
+So does each fairness ID named in the `flowWeights` table of a configured
+`weighted-fair-share-fairness-policy`, except a key named `other` and a key the rule above always
+reports as `other` (longer than 256 bytes or not valid UTF-8). These IDs do not count against
+the cap: each one adds a label value on top of it. The table is matched on the whole fairness ID,
+so a tenant key does not cover composed `<tenant>/<session>` IDs. At startup the EPP logs the
+limit and the number of pinned IDs (`pinnedFairnessIDs`).
 These bounds apply whether or not the `flowControl` feature gate is enabled. When Flow Control is
 enabled, its series for a `fairness_id` are removed when the corresponding flow is garbage collected.
 Composed IDs make the label session-granular for tenant-stamped traffic, so a pool that enables
@@ -177,10 +183,15 @@ gauge releases each request when it completes or its ext_proc stream closes.
 vLLM includes `usage` in a chat completions or completions stream only when the request sets
 `stream_options.include_usage` or the server runs with `--enable-force-include-usage`. A stream
 without it adds no observation to these metrics, but `llm_d_epp_request_total` and
-`llm_d_epp_request_ttft_seconds` still count it. Run vLLM with `--enable-force-include-usage`
-when these metrics must cover every stream. Clients then receive `usage` in every chat
-completions and completions stream, including a final chunk with an empty `choices` list.
-Messages and Responses streams carry `usage` without either setting.
+`llm_d_epp_request_ttft_seconds` still count it. To cover every stream, set
+`requestHandler.requestStreamUsage: true` in the EndpointPickerConfig. The EPP then adds
+`stream_options.include_usage` to a stream that does not ask for usage and removes the final chunk
+with an empty `choices` list from the response. vLLM sends `system_fingerprint` on that chunk
+instead of the last content chunk when `include_usage` is set, so the client receives the stream
+without `system_fingerprint`. A stream that sets only `stream_options.continuous_usage_stats` is
+forwarded unchanged. Running vLLM with `--enable-force-include-usage` also covers every stream, but
+clients then receive `usage` in every chat completions and completions stream, including that final
+chunk. Messages and Responses streams carry `usage` without either setting.
 
 Per-surface p95 latency uses the histogram buckets:
 
@@ -386,6 +397,14 @@ Forwarded observations confirm successful ext-proc sends to Envoy; application r
 preservation of tool calls remain unverified. These attributes contain no response bodies,
 tool names, or tool arguments, and do not measure model-server tool-parser quality.
 
+### Baggage trace attributes
+
+`--trace-baggage-keys` takes a comma-separated list of W3C Baggage keys. EPP records each listed
+key found in the request's `baggage` header as an attribute on the request span, named after the
+key. The list is empty by default, which records none. Values longer than 256 bytes are cut to
+that length. An attribute EPP sets itself keeps its value when a baggage key has the same name.
+Baggage is set by the client, so list only keys that are safe to export to the tracing backend.
+
 ### Inference pool
 
 These metrics are owned by EPP pool aggregation. They summarize model-server endpoint metrics for
@@ -566,6 +585,15 @@ and updated when the filter observes a change in an endpoint's health. The `reas
 | `llm_d_epp_endpoint_health_readmissions_total` | Counter | `plugin_name`, `reason` | Unhealthy marks cleared. An endpoint is readmitted once no reason marks it. |
 | `llm_d_epp_endpoint_health_fail_open_total` | Counter | `plugin_name` | Scheduling cycles in which every candidate was unhealthy and all were kept. Alert on a non-zero rate. |
 
+### Models responder
+
+These metrics belong to `models-responder`. They are registered when the plugin is configured and
+updated once per inference request it screens.
+
+| Full metric name | Type | Labels | Notes |
+|---|---|---|---|
+| `llm_d_epp_models_responder_screen_decisions_total` | Counter | `plugin_name`, `model_name`, `outcome` | Requests screened, by target model and by which endpoints were kept. The outcomes are described in the [plugin README](../pkg/epp/framework/plugins/requesthandling/responder/models/README.md#metrics). |
+
 ### Prefix cache indexer (approximate)
 
 These metrics belong to the `approx-prefix-cache-producer`. They describe its approximate prefix
@@ -595,8 +623,8 @@ match data but is not instrumented here. Requests that reach no endpoint are not
 | `llm_d_epp_prefix_mm_prompt_tokens` | Histogram | `plugin_name`, `plugin_type`, `endpoint_role` | Multimodal prompt tokens the multimodal prediction was measured against. |
 
 For a request disaggregated into prefill and decode stages, the prediction is recorded for the
-`prefill` profile's endpoint and `endpoint_role` is `prefill`, since the sidecar's default `nixlv2`
-KV connector returns the prefiller's cached-token count. For every other request it is recorded for
+endpoint of the prefill profile the scheduling result names, and `endpoint_role` is `prefill`,
+since the sidecar's default `nixlv2` KV connector returns the prefiller's cached-token count. For every other request it is recorded for
 the primary profile's endpoint, and `endpoint_role` is `decode`.
 
 The `modality` label holds the modalities the request carries as a comma-joined sorted list (`none`
@@ -670,7 +698,7 @@ pod's count while the prediction describes the prefill pod. Under those connecto
 the ratios is not index accuracy.
 
 The two maxima are scoped differently from each other for a disaggregated request.
-`llm_d_epp_prefix_best_predicted_cached_tokens` covers the `prefill` profile's scored candidates,
+`llm_d_epp_prefix_best_predicted_cached_tokens` covers the prefill profile's scored candidates,
 while `llm_d_epp_prefix_best_available_cached_tokens` is taken before the role filters run and so
 spans prefill and decode pods together. A decode pod holding the prefix raises the available maximum
 while being unreachable by the prefill decision. Read the ratio between the two maxima as a filtering
@@ -712,14 +740,12 @@ A request records the first outcome in this table that applies to it.
 | `unparsed-body` | The body was kept as raw bytes and cannot carry the source. |
 | `pulled` | The request carries `kv_transfer_params.remote_kv_source` and the source header. |
 
-`endpoint_role` follows the prefix cache prediction metrics: `prefill` for a request with a target in
-the profile named `prefill`, `decode` otherwise when the primary profile has a target, and empty when
-neither has one. The role does not read `prefillProfileName`. On a P/D deployment whose prefill
-profile has another name, both metric families label its requests `decode`, where the P2P metrics
-describe the prefill endpoint and the prefix cache prediction metrics the decode endpoint.
+`endpoint_role` follows the prefix cache prediction metrics: `prefill` for a request whose
+scheduling result names a prefill profile with a target, `decode` otherwise when the primary profile
+has a target, and empty when neither has one. The name comes from the profile handler that ran the
+prefill profile, so a renamed prefill profile is still labelled `prefill`.
 
-On an aggregated deployment, or a P/D deployment whose prefill profile is named `prefill`, the share
-of prompt tokens the router sent to pull is `llm_d_epp_p2p_source_predicted_pulled_tokens_sum`
+The share of prompt tokens the router sent to pull is `llm_d_epp_p2p_source_predicted_pulled_tokens_sum`
 divided by `llm_d_epp_prefix_prompt_tokens_sum` of the prefix producer named in
 `prefixMatchInfoProducerName`, matched on `endpoint_role`. The share vLLM served from a peer is
 `vllm:prompt_tokens_cached_by_source_total{source="p2p"}` divided by `vllm:prompt_tokens_total` on the
@@ -851,9 +877,11 @@ because those requests resolve with `source="header"`.
 The `fairness_id` label uses the shared cap described in [Metrics catalog](#metrics-catalog).
 Scheduling and Flow Control always use the original ID; only the label is folded. Per replica:
 
-- `fairness_id` takes at most cap + 2 values (`default-flow` and `other` on top of the cap).
+- `fairness_id` takes at most cap + 2 values (`default-flow` and `other` on top of the cap), plus
+  at most one for each distinct fairness ID named in a `flowWeights` table.
   `llm_d_epp_fairness_id_resolved_total` has about cap + 3 series, and at most 2 × cap + 5 when
-  the same IDs arrive from both the header and agent identity.
+  the same IDs arrive from both the header and agent identity, plus one for each `flowWeights` ID
+  and source it arrives from.
 - Cap slots are not freed until the EPP restarts. Short-lived agent session IDs can fill the cap,
   after which new header IDs are folded too.
 - A client that sends `default-flow` or `other` as its ID is counted with `source="header"`. A
@@ -918,11 +946,13 @@ These metrics are owned by the `program-aware-fairness` Flow Control policy. The
 Control alone does not emit them. `program_id` is the request's fairness ID and shares the
 `fairness_id` label cap. Programs past the cap are not reported on these gauges.
 
+The `policy` label is the configured plugin instance name.
+
 | Full metric name | Type | Labels | Notes |
 |---|---|---|---|
-| `llm_d_epp_program_aware_jains_fairness_index` | Gauge | - | Jain's fairness index across programs. |
-| `llm_d_epp_program_aware_avg_wait_time_milliseconds` | Gauge | `program_id` | Mean wait time. |
-| `llm_d_epp_program_aware_attained_service_tokens` | Gauge | `program_id` | Attained service. |
+| `llm_d_epp_program_aware_jains_fairness_index` | Gauge | `policy` | Jain's fairness index across programs. |
+| `llm_d_epp_program_aware_avg_wait_time_milliseconds` | Gauge | `policy`, `program_id` | Mean wait time. |
+| `llm_d_epp_program_aware_attained_service_tokens` | Gauge | `policy`, `program_id` | Attained service. |
 
 ### Latency by prompt bucket and path
 

@@ -910,6 +910,8 @@ func TestDirector_HandleRequest(t *testing.T) {
 		wantRawBodyUnchanged    bool   // If true, assert reqCtx.Request.RawBody is byte-identical to the marshaled reqBodyMap.
 		propagatePriority       bool   // If true, enable requestHandler.propagatePriority on the director.
 		composeFairnessIDs      bool   // If true, enable requestHandler.composeFairnessIDs on the director.
+		requestStreamUsage      bool   // If true, enable requestHandler.requestStreamUsage on the director.
+		wantUsageRequested      bool   // Asserted against returnedReqCtx.StreamUsageRequested.
 		fairnessIDHeader        string // If non-empty, set as metadata.FlowFairnessIDKey on the incoming request.
 		wantFairnessID          string // If non-empty, asserted against returnedReqCtx.SchedulingRequest.FairnessID.
 		wantAdmitPriority       *int   // If non-nil, asserted against the priority passed to Admit and carried on the request.
@@ -1000,6 +1002,119 @@ func TestDirector_HandleRequest(t *testing.T) {
 				},
 				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
 			},
+			wantRawBodyUnchanged:   true,
+			inferenceObjectiveName: objectiveName,
+		},
+		{
+			name: "streamed chat request asks for usage when requestStreamUsage is enabled",
+			reqBodyMap: map[string]any{
+				"model":    model,
+				"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+				"stream":   true,
+			},
+			mockAdmissionController: &mockAdmissionController{admitErr: nil},
+			schedulerMockSetup: func(m *mockScheduler) {
+				m.scheduleResults = defaultSuccessfulScheduleResults
+			},
+			initialTargetModelName: model,
+			wantReqCtx: &handlers.RequestContext{
+				ObjectiveKey:    objectiveName,
+				TargetModelName: model,
+				TargetPod: &fwkdl.EndpointMetadata{
+					ID:          types.NamespacedName{Namespace: "default", Name: "pod1"},
+					Address:     "192.168.1.100",
+					Port:        "8000",
+					MetricsHost: "192.168.1.100:8000",
+				},
+				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
+			},
+			requestStreamUsage: true,
+			wantUsageRequested: true,
+			wantMutatedBody: map[string]any{
+				"model":          model,
+				"messages":       []any{map[string]any{"role": "user", "content": "hello"}},
+				"stream":         true,
+				"stream_options": map[string]any{"include_usage": true},
+			},
+			inferenceObjectiveName: objectiveName,
+		},
+		{
+			name: "streamed chat request is forwarded unchanged when requestStreamUsage is disabled",
+			reqBodyMap: map[string]any{
+				"model":    model,
+				"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+				"stream":   true,
+			},
+			mockAdmissionController: &mockAdmissionController{admitErr: nil},
+			schedulerMockSetup: func(m *mockScheduler) {
+				m.scheduleResults = defaultSuccessfulScheduleResults
+			},
+			initialTargetModelName: model,
+			wantReqCtx: &handlers.RequestContext{
+				ObjectiveKey:    objectiveName,
+				TargetModelName: model,
+				TargetPod: &fwkdl.EndpointMetadata{
+					ID:          types.NamespacedName{Namespace: "default", Name: "pod1"},
+					Address:     "192.168.1.100",
+					Port:        "8000",
+					MetricsHost: "192.168.1.100:8000",
+				},
+				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
+			},
+			wantRawBodyUnchanged:   true,
+			inferenceObjectiveName: objectiveName,
+		},
+		{
+			name: "non-streaming chat request is forwarded unchanged with requestStreamUsage",
+			reqBodyMap: map[string]any{
+				"model":    model,
+				"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+			},
+			mockAdmissionController: &mockAdmissionController{admitErr: nil},
+			schedulerMockSetup: func(m *mockScheduler) {
+				m.scheduleResults = defaultSuccessfulScheduleResults
+			},
+			initialTargetModelName: model,
+			wantReqCtx: &handlers.RequestContext{
+				ObjectiveKey:    objectiveName,
+				TargetModelName: model,
+				TargetPod: &fwkdl.EndpointMetadata{
+					ID:          types.NamespacedName{Namespace: "default", Name: "pod1"},
+					Address:     "192.168.1.100",
+					Port:        "8000",
+					MetricsHost: "192.168.1.100:8000",
+				},
+				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
+			},
+			requestStreamUsage:     true,
+			wantRawBodyUnchanged:   true,
+			inferenceObjectiveName: objectiveName,
+		},
+		{
+			name: "streamed chat request that asks for usage is forwarded unchanged with requestStreamUsage",
+			reqBodyMap: map[string]any{
+				"model":          model,
+				"messages":       []any{map[string]any{"role": "user", "content": "hello"}},
+				"stream":         true,
+				"stream_options": map[string]any{"include_usage": true},
+			},
+			mockAdmissionController: &mockAdmissionController{admitErr: nil},
+			schedulerMockSetup: func(m *mockScheduler) {
+				m.scheduleResults = defaultSuccessfulScheduleResults
+			},
+			initialTargetModelName: model,
+			wantReqCtx: &handlers.RequestContext{
+				ObjectiveKey:    objectiveName,
+				TargetModelName: model,
+				TargetPod: &fwkdl.EndpointMetadata{
+					ID:          types.NamespacedName{Namespace: "default", Name: "pod1"},
+					Address:     "192.168.1.100",
+					Port:        "8000",
+					MetricsHost: "192.168.1.100:8000",
+				},
+				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
+			},
+			requestStreamUsage:     true,
 			wantRawBodyUnchanged:   true,
 			inferenceObjectiveName: objectiveName,
 		},
@@ -2258,6 +2373,9 @@ func TestDirector_HandleRequest(t *testing.T) {
 				if test.composeFairnessIDs {
 					config = config.WithComposeFairnessIDs(true)
 				}
+				if test.requestStreamUsage {
+					config = config.WithRequestStreamUsage(true)
+				}
 
 				endpointCandidates := NewDatastoreEndpointCandidates(ds)
 				director := NewDirectorWithConfig(ds, mockSched, test.mockAdmissionController, endpointCandidates, config, "")
@@ -2386,6 +2504,8 @@ func TestDirector_HandleRequest(t *testing.T) {
 						}
 					}
 				}
+
+				assert.Equal(t, test.wantUsageRequested, returnedReqCtx.StreamUsageRequested, "reqCtx.StreamUsageRequested mismatch")
 
 				if test.wantFairnessID != "" {
 					require.NotNil(t, returnedReqCtx.SchedulingRequest, "SchedulingRequest should be populated")
@@ -3030,6 +3150,79 @@ func TestDirector_HandleResponseBody(t *testing.T) {
 	}
 }
 
+// grpcStatusSnapshot records the grpc-status value each ResponseBody call saw
+// at call time, so a later write to the shared headers map cannot rewrite
+// what an earlier chunk observed.
+type grpcStatusSnapshot struct {
+	mu       sync.Mutex
+	statuses []string
+	// served records the endpoint each call saw on the response metadata, which
+	// response plugins read to tell a fallback-served response from one the
+	// target served.
+	served []string
+}
+
+func (p *grpcStatusSnapshot) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Type: "grpc-status-snapshot", Name: "snapshot"}
+}
+
+func (p *grpcStatusSnapshot) ResponseBody(_ context.Context, _ *fwksched.InferenceRequest,
+	response *fwkrh.Response, _ *fwkdl.EndpointMetadata) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.statuses = append(p.statuses, response.Headers[grpcframe.HeaderStatus])
+	served, _ := metadata.ServedEndpoint(response.ReqMetadata)
+	p.served = append(p.served, served)
+}
+
+// A gRPC stream's final status arrives in trailers, after the response
+// headers were already reported, so the director publishes it on the
+// end-of-stream response headers: intermediate chunks do not see it, and the
+// final chunk does.
+func TestDirector_HandleResponseBody_PublishesGRPCStatus(t *testing.T) {
+	snapshot := &grpcStatusSnapshot{}
+
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	ds := datastore.NewDatastore(t.Context(), nil)
+	director := NewDirectorWithConfig(ds, &mockScheduler{}, nil, NewDatastoreEndpointCandidates(ds),
+		NewConfig().WithResponseStreamingPlugins(snapshot), "")
+
+	reqCtx := &handlers.RequestContext{
+		Request: &handlers.Request{
+			ID:      "grpc-status-req",
+			Headers: map[string]string{},
+			// Envoy reports the endpoint that actually served the request in
+			// the response metadata, which a fallback-served response needs so
+			// response plugins do not charge the target endpoint for it.
+			Metadata: map[string]any{
+				metadata.DestinationEndpointNamespace: map[string]any{
+					metadata.DestinationEndpointServedKey: "10.0.0.2:50051",
+				},
+			},
+		},
+		Response: &handlers.Response{Headers: map[string]string{"content-type": grpcframe.MediaType}},
+		TargetPod: &fwkdl.EndpointMetadata{
+			ID: types.NamespacedName{Namespace: "namespace1", Name: "test-pod-name"},
+		},
+		ResponseGRPCStatus: "14",
+	}
+
+	director.HandleResponseBody(ctx, reqCtx, false)
+	require.Eventually(t, func() bool {
+		snapshot.mu.Lock()
+		defer snapshot.mu.Unlock()
+		return len(snapshot.statuses) >= 1
+	}, time.Second, 10*time.Millisecond, "the intermediate chunk should have been processed")
+
+	director.HandleResponseBody(ctx, reqCtx, true)
+
+	snapshot.mu.Lock()
+	defer snapshot.mu.Unlock()
+	require.Equal(t, []string{"", "14"}, snapshot.statuses)
+	require.Equal(t, []string{"10.0.0.2:50051", "10.0.0.2:50051"}, snapshot.served,
+		"every body-phase response carries the endpoint Envoy reports it served")
+}
+
 func TestDirector_HandleResponseBody_ChunkOrdering(t *testing.T) {
 	// orderTrackingPlugin records the RequestId of each chunk it processes.
 	// Since we set a unique RequestId per chunk, the recorded order lets us
@@ -3400,6 +3593,59 @@ func TestDirector_ReleasesDispatchReservationAfterPreRequest(t *testing.T) {
 	_, err = dir.HandleRequest(ctx, reqCtx, parseResult.Body)
 	require.NoError(t, err)
 	require.True(t, released)
+}
+
+func TestDirector_ForwardsRoutingHeadersAfterProducerTimeout(t *testing.T) {
+	for _, phase := range []fwkrh.DataProducerPhase{fwkrh.DataProducerPhaseRequestHandling, fwkrh.DataProducerPhaseScheduling} {
+		t.Run(string(phase), func(t *testing.T) {
+			endpoint := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{
+				Address: "192.168.1.100",
+				Port:    "8000",
+				ID:      types.NamespacedName{Name: "pod1", Namespace: "default"},
+			}, nil, fwkdl.NewAttributes())
+			result := &fwksched.SchedulingResult{
+				PrimaryProfileName: "decode",
+				ProfileResults: map[string]*fwksched.ProfileRunResult{
+					"decode": {TargetEndpoints: []fwksched.Endpoint{endpoint}},
+				},
+			}
+			dir, ctx := newSinglePodDirector(t, result)
+			producer := &lateHeaderPlugin{
+				header:   routing.KVCacheSourceHeader,
+				started:  make(chan struct{}),
+				release:  make(chan struct{}),
+				observed: make(chan string, 1),
+			}
+			t.Cleanup(func() { close(producer.release) })
+			cfg := NewConfig().WithPreRequestPlugins(&mockPreRequestPlugin{
+				name: "stamp-routing-header",
+				modifyFn: func(request *fwksched.InferenceRequest) {
+					routing.SetRoutingHeader(request.Headers, routing.KVCacheSourceHeader, "10.0.0.1:5555")
+				},
+			})
+			if phase == fwkrh.DataProducerPhaseRequestHandling {
+				cfg.WithRequestHandlingDataProducers(producer)
+			} else {
+				cfg.WithDataProducerPlugins(producer)
+			}
+			dir.requestControlPlugins = *cfg
+
+			body := []byte(`{"model":"m","prompt":"p"}`)
+			originalHeaders := map[string]string{":path": "/v1/completions"}
+			reqCtx := &handlers.RequestContext{
+				Request: &handlers.Request{ID: "test-producer-timeout", Headers: originalHeaders, RawBody: body},
+				Parser:  openai.NewOpenAIParser(),
+			}
+			parsed, err := reqCtx.Parser.ParseRequest(ctx, body, originalHeaders)
+			require.NoError(t, err)
+			got, err := dir.HandleRequest(ctx, reqCtx, parsed.Body)
+			require.NoError(t, err)
+			assert.Equal(t, "10.0.0.1:5555", got.Request.Headers[routing.KVCacheSourceHeader])
+			assert.Equal(t, got.SchedulingRequest.Headers, got.Request.Headers)
+			assert.Equal(t, "/v1/completions", got.Request.Headers[":path"])
+			assert.NotContains(t, originalHeaders, routing.KVCacheSourceHeader)
+		})
+	}
 }
 
 // TestDirector_ReleasesProducerStateOnEarlyReturn verifies that per-request state a DataProducer
@@ -4014,10 +4260,10 @@ func TestPrepareRequest_DataParallelRankHeader(t *testing.T) {
 		wantTargets []string
 	}{
 		{
-			name:         "rank endpoint sets its data-parallel rank and drops fallbacks",
-			result:       result(endpoint("pod1-rank-1", "10.0.0.1", 1, 2), endpoint("pod1-rank-0", "10.0.0.1", 0, 2), endpoint("pod2", "10.0.0.2", 0, 0)),
+			name:         "rank endpoint sets its global rank and drops fallbacks",
+			result:       result(endpoint("pod1-rank-1", "10.0.0.1", 3, 2), endpoint("pod1-rank-0", "10.0.0.1", 2, 2), endpoint("pod2", "10.0.0.2", 0, 0)),
 			wantEndpoint: "10.0.0.1:8000",
-			wantRank:     "1",
+			wantRank:     "3",
 			wantTargets:  []string{"pod1-rank-1"},
 		},
 		{

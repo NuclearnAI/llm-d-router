@@ -80,7 +80,7 @@ The default `0 / 1 / 2` weights an output token at twice an input token. The coe
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `flowWeights` | `{}` | Weight per fairness ID. Values must be `> 0`; there is no upper bound. |
+| `flowWeights` | `{}` | Weight per fairness ID. Values must be `> 0`; there is no upper bound. Each entry adds one metric label value (see [Observability](#observability)). |
 | `defaultFlowWeight` | `1` | Weight for any fairness ID absent from `flowWeights`, including the default tenant unstamped callers fall into. Must be `> 0`. |
 | `idleTtlSeconds` | `3600` | Idle flows are pruned after this. `0` disables pruning. |
 | `sweepSeconds` | `300` | Minimum interval between idle sweeps. |
@@ -88,7 +88,7 @@ The default `0 / 1 / 2` weights an output token at twice an input token. The coe
 | `costPerInputToken` | `1` | Cost per prompt token. |
 | `costPerOutputToken` | `2` | Cost per completion token. |
 | `costPerCachedInputToken` | `costPerInputToken` | Cost per prompt token the model server reports as a prefix-cache hit. |
-| `flowRates` | `{}` | Ceiling per fairness ID: `rate` in cost per second and `burst` in cost. `burst` defaults to 10 seconds of `rate`. See [Rate ceilings](#rate-ceilings). |
+| `flowRates` | `{}` | Ceiling per fairness ID: `rate` in cost per second and `burst` in cost. `burst` defaults to 10 seconds of `rate`. See [Rate ceilings](#rate-ceilings). Each entry adds one metric label value, as for `flowWeights`. |
 | `defaultFlowRate` | none | Ceiling for any fairness ID absent from `flowRates`, including the default tenant. |
 | `initialOutputTokens` | `256` | Output tokens assumed for a rate-limited flow's requests until one completes. |
 | `bytesPerInputToken` | `4` | Request bytes per prompt token assumed until a rate-limited flow's first request completes. |
@@ -150,7 +150,7 @@ The weight gauge shows the weight resolved for each flow. A fairness ID that doe
 
 `rate(llm_d_epp_weighted_fair_share_charged_cost_total[5m])` is each fairness ID's throughput in cost per second, for every flow whether or not it has a ceiling; compare it with `flow_rate`. `rate_balance` is set for rate-limited IDs only; a flow dispatches while it is positive.
 
-All of these label `flow_id` with the fairness ID, so they share the `--fairness-id-metric-label-limit` cap. Flows past the cap are still scheduled and charged; they just get no series.
+All of these label `flow_id` with the fairness ID, so they share the `--fairness-id-metric-label-limit` cap. Flows past the cap are still scheduled and charged; they just get no series. A fairness ID named in `flowWeights` or `flowRates` keeps its own label on these metrics and on every `fairness_id` metric after the cap fills, unless the limit is 0 or the ID is `other`, the overflow label. The match is on the whole fairness ID, as for the weight. The IDs are pinned when the policy is built, so this applies to every configured instance, whether or not a priority band references it. The EPP logs the number of pinned IDs at startup (see the metrics docs).
 
 ## Trade-offs
 

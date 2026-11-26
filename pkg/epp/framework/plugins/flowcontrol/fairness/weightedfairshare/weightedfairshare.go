@@ -222,6 +222,13 @@ func WeightedFairShareFairnessPolicyFactory(
 			}
 		}
 	}
+	// A fairness ID the operator gave a weight or a ceiling keeps its own metric label after the label cap fills.
+	for id := range cfg.FlowWeights {
+		metricsutil.PinFairnessID(id)
+	}
+	for id := range cfg.FlowRates {
+		metricsutil.PinFairnessID(id)
+	}
 	return &weightedFairShare{
 		name: name, cfg: cfg, now: time.Now,
 		vserviceGauge: vservice, weightGauge: weight,
