@@ -120,6 +120,7 @@ func TestConfig_RejectsInvalidRates(t *testing.T) {
 		{name: "negative_initial_output_tokens", params: `{"initialOutputTokens": -1}`},
 		{name: "zero_bytes_per_input_token", params: `{"bytesPerInputToken": 0}`},
 		{name: "zero_pending_ttl", params: `{"pendingTtlSeconds": 0}`},
+		{name: "negative_max_hold", params: `{"maxHoldSeconds": -1}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -335,4 +336,42 @@ func TestRateMetrics(t *testing.T) {
 	assert.InDelta(t, 5.0, testutil.ToFloat64(p.rateGauge.WithLabelValues("capped")), 1e-9)
 	assert.InDelta(t, 70.0, testutil.ToFloat64(p.balanceGauge.WithLabelValues("capped")), 1e-9)
 	assert.InDelta(t, 30.0, testutil.ToFloat64(p.costCounter.WithLabelValues("capped")), 1e-9)
+}
+
+func TestPick_HeldRequestDispatchesAfterMaxHold(t *testing.T) {
+	p, clk := newRatedPolicy(t, `{"flowRates": {"capped": {"rate": 1, "burst": 10}}, "maxHoldSeconds": 120,
+		"costPerInputToken": 0, "costPerOutputToken": 1}`)
+	state := &minVirtualService{}
+	require.Equal(t, "capped", pickID(t, p, band(state, queueOf(request("capped", 0, "c1", 0), clk.t))))
+	require.Negative(t, balance(t, p, "capped"))
+
+	assert.Empty(t, pickID(t, p, band(state, queueOf(request("capped", 0, "c2", 0), clk.t.Add(-119*time.Second)))))
+	assert.Equal(t, "capped", pickID(t, p, band(state, queueOf(request("capped", 0, "c2", 0), clk.t.Add(-120*time.Second)))))
+}
+
+func TestRate_DebtFlooredAtMaxHoldOfRefill(t *testing.T) {
+	p, clk := newRatedPolicy(t, `{"flowRates": {"capped": {"rate": 10, "burst": 100}}, "maxHoldSeconds": 5,
+		"costPerInputToken": 0, "costPerOutputToken": 1}`)
+	finish(p, request("capped", 0, "c1", 0), 0, 0, 1000)
+	assert.InDelta(t, -50.0, balance(t, p, "capped"), 1e-9)
+
+	// A request arriving at the floor is eligible within maxHoldSeconds of refill.
+	state := &minVirtualService{}
+	clk.advance(5 * time.Second)
+	assert.Empty(t, pickID(t, p, band(state, queueOf(request("capped", 0, "c2", 0), clk.t))))
+	clk.advance(100 * time.Millisecond)
+	assert.Equal(t, "capped", pickID(t, p, band(state, queueOf(request("capped", 0, "c2", 0), clk.t))))
+}
+
+func TestSettle_RefundsOnlyWhatTheFloorLetThrough(t *testing.T) {
+	// Floor -50. The 256 estimate debits 150 (100 -> -50); settling to an actual cost of 30
+	// leaves 100 - 30 = 70.
+	p, clk := newRatedPolicy(t, `{"flowRates": {"capped": {"rate": 10, "burst": 100}}, "maxHoldSeconds": 5,
+		"costPerInputToken": 0, "costPerOutputToken": 1}`)
+	req := request("capped", 0, "c1", 0)
+	require.Equal(t, "capped", pickID(t, p, band(&minVirtualService{}, queueOf(req, clk.t))))
+	require.InDelta(t, -50.0, balance(t, p, "capped"), 1e-9)
+
+	finish(p, req, 0, 0, 30)
+	assert.InDelta(t, 70.0, balance(t, p, "capped"), 1e-9)
 }

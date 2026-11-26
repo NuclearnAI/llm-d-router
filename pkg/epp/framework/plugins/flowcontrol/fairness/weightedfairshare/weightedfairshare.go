@@ -77,6 +77,9 @@ type Config struct {
 	BytesPerInputToken  float64 `json:"bytesPerInputToken,omitempty"`
 	// PendingTTLSeconds bounds how long a dispatch estimate waits for its request's end of stream.
 	PendingTTLSeconds float64 `json:"pendingTtlSeconds,omitempty"`
+	// MaxHoldSeconds bounds how long a ceiling holds a request: a request of a flow over its ceiling
+	// dispatches once it has waited this long. Zero holds it until the request TTL.
+	MaxHoldSeconds float64 `json:"maxHoldSeconds,omitempty"`
 }
 
 // DefaultConfig returns the configuration used when no parameters are supplied.
@@ -125,6 +128,8 @@ func (c Config) validate() error {
 		return fmt.Errorf("bytesPerInputToken must be > 0, got %v", c.BytesPerInputToken)
 	case c.PendingTTLSeconds <= 0:
 		return fmt.Errorf("pendingTtlSeconds must be > 0, got %v", c.PendingTTLSeconds)
+	case c.MaxHoldSeconds < 0:
+		return fmt.Errorf("maxHoldSeconds must be >= 0, got %v", c.MaxHoldSeconds)
 	}
 	for id, w := range c.FlowWeights {
 		if w <= 0 {
@@ -270,7 +275,7 @@ func (p *weightedFairShare) Pick(
 		key := queue.FlowKey()
 		// A flow over its ceiling is skipped before catchUp, so it is raised to the band's
 		// minimum when it becomes eligible and earns no credit for the time it was held.
-		if !p.rateAllows(key.ID, now) {
+		if !p.rateAllows(key.ID, now) && !p.heldLongEnough(head.EnqueueTime(), now) {
 			return true
 		}
 		vs, raised := p.stateFor(key).catchUp(minVS.virtualService, now)

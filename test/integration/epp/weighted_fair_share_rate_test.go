@@ -19,6 +19,7 @@ package epp
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	envoyTypePb "github.com/envoyproxy/go-control-plane/envoy/type/v3"
@@ -35,10 +36,16 @@ import (
 	eppharness "github.com/llm-d/llm-d-router/test/framework/epp/harness"
 )
 
-// A fairness ID over its rate ceiling is held in its queue until the request TTL while another
-// fairness ID dispatches, and the ceiling is charged from the stream's usage block, with cached
-// prompt tokens priced separately.
-func TestWeightedFairShareRateCeiling(t *testing.T) {
+type rateCeilingEPP struct {
+	newClient func() extProcPb.ExternalProcessor_ProcessClient
+	chat      func(fairnessID, requestID string) []*extProcPb.ProcessingRequest
+}
+
+// startRateCeilingEPP runs an EPP whose only band uses weighted fair share with a ceiling on
+// fairness ID alpha, then drives alpha's balance to 10 - 30 = -20 with one completed stream: 100
+// prompt tokens with 60 cached and 10 completion tokens cost 0.5*40 + 10 = 30.
+func startRateCeilingEPP(t *testing.T, extraParams, ttl string) rateCeilingEPP {
+	t.Helper()
 	configText := fmt.Sprintf(`
 apiVersion: llm-d.ai/v1
 kind: EndpointPickerConfig
@@ -54,7 +61,7 @@ plugins:
     costPerCachedInputToken: 0
     costPerOutputToken: 1
     flowRates:
-      alpha: {rate: 0.001, burst: 10}
+      alpha: {rate: 0.001, burst: 10}%[2]s
 requestHandler:
   parsers:
   - pluginRef: openai-parser
@@ -67,11 +74,11 @@ schedulingProfiles:
   plugins:
   - pluginRef: random-picker
 flowControl:
-  defaultRequestTTL: "1s"
+  defaultRequestTTL: %[3]q
   priorityBands:
   - priority: 2
     fairnessPolicyRef: %[1]s
-`, weightedfairshare.WeightedFairShareFairnessPolicyType)
+`, weightedfairshare.WeightedFairShareFairnessPolicyType, extraParams, ttl)
 
 	registry := crmetrics.Registry
 	crmetrics.Registry = prometheus.NewRegistry()
@@ -81,26 +88,26 @@ flowControl:
 	pods := []eppharness.PodState{eppharness.P(0, 0, 0.1, modelMyModelTarget)}
 	h.WithPods(pods).WaitForSync(len(pods), modelMyModel).WaitForMetricsDelivery()
 
-	newClient := func() extProcPb.ExternalProcessor_ProcessClient {
-		client, err := extProcPb.NewExternalProcessorClient(h.GRPCConn()).Process(t.Context())
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = client.CloseSend() })
-		return client
-	}
-	chat := func(fairnessID, requestID string) []*extProcPb.ProcessingRequest {
-		return fwkepp.ReqRaw(map[string]string{
-			":method":                    "POST",
-			":path":                      "/v1/chat/completions",
-			"content-type":               "application/json",
-			reqcommon.RequestIDHeaderKey: requestID,
-			metadata.ObjectiveKey:        modelMyModel,
-			metadata.FlowFairnessIDKey:   fairnessID,
-		}, fmt.Sprintf(`{"model":%q,"stream":true,"messages":[{"role":"user","content":"hello"}]}`, modelMyModel))
+	e := rateCeilingEPP{
+		newClient: func() extProcPb.ExternalProcessor_ProcessClient {
+			client, err := extProcPb.NewExternalProcessorClient(h.GRPCConn()).Process(t.Context())
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = client.CloseSend() })
+			return client
+		},
+		chat: func(fairnessID, requestID string) []*extProcPb.ProcessingRequest {
+			return fwkepp.ReqRaw(map[string]string{
+				":method":                    "POST",
+				":path":                      "/v1/chat/completions",
+				"content-type":               "application/json",
+				reqcommon.RequestIDHeaderKey: requestID,
+				metadata.ObjectiveKey:        modelMyModel,
+				metadata.FlowFairnessIDKey:   fairnessID,
+			}, fmt.Sprintf(`{"model":%q,"stream":true,"messages":[{"role":"user","content":"hello"}]}`, modelMyModel))
+		},
 	}
 
-	// 100 prompt tokens with 60 cached and 10 completion tokens cost 0.5*40 + 10 = 30, leaving
-	// alpha's balance at 10 - 30 = -20.
-	first := append(chat("alpha", "alpha-1"), ReqResponseOnly(
+	first := append(e.chat("alpha", "alpha-1"), ReqResponseOnly(
 		map[string]string{"content-type": "text/event-stream", ":status": "200"},
 		"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n",
 		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],"+
@@ -108,7 +115,7 @@ flowControl:
 			"\"prompt_tokens_details\":{\"cached_tokens\":60}}}\n\n",
 		"data: [DONE]\n\n",
 	)...)
-	responses, err := fwkepp.StreamedRequest(t, newClient(), first, len(first))
+	responses, err := fwkepp.StreamedRequest(t, e.newClient(), first, len(first))
 	require.NoError(t, err)
 	require.Len(t, responses, len(first))
 
@@ -119,18 +126,30 @@ flowControl:
 llm_d_epp_weighted_fair_share_charged_cost_total{flow_id="alpha",policy="%s"} 30
 `, weightedfairshare.WeightedFairShareFairnessPolicyType),
 	})
+	return e
+}
 
-	held := newClient()
-	for _, req := range chat("alpha", "alpha-2") {
+// sendHeldAndRouteBeta sends alpha's next request, then requires beta, which has no ceiling, to be
+// routed while alpha's request is held.
+func (e rateCeilingEPP) sendHeldAndRouteBeta(t *testing.T) extProcPb.ExternalProcessor_ProcessClient {
+	t.Helper()
+	held := e.newClient()
+	for _, req := range e.chat("alpha", "alpha-2") {
 		require.NoError(t, held.Send(req))
 	}
-
-	responses, err = fwkepp.StreamedRequest(t, newClient(), chat("beta", "beta-1"), 2)
+	responses, err := fwkepp.StreamedRequest(t, e.newClient(), e.chat("beta", "beta-1"), 2)
 	require.NoError(t, err)
-	require.Len(t, responses, 2, "beta has no ceiling and must be routed while alpha is held")
+	require.Len(t, responses, 2, "beta must be routed while alpha is held")
 	for _, resp := range responses {
 		assert.Nil(t, resp.GetImmediateResponse())
 	}
+	return held
+}
+
+// Without maxHoldSeconds, a request over the ceiling stays queued until the request TTL.
+func TestWeightedFairShareRateCeiling_HoldsUntilTTL(t *testing.T) {
+	e := startRateCeilingEPP(t, "", "1s")
+	held := e.sendHeldAndRouteBeta(t)
 
 	resp, err := held.Recv()
 	require.NoError(t, err)
@@ -144,4 +163,21 @@ llm_d_epp_weighted_fair_share_charged_cost_total{flow_id="alpha",policy="%s"} 30
 		}
 	}
 	assert.Equal(t, string(errcommon.RequestDroppedReasonTTLExpired), reason)
+}
+
+// With maxHoldSeconds below the request TTL, a request over the ceiling is delayed and then
+// routed. The balance is floored at -rate*maxHoldSeconds = -0.003, so the refill makes alpha
+// eligible about 3 s after its first request settled.
+func TestWeightedFairShareRateCeiling_MaxHoldDispatches(t *testing.T) {
+	e := startRateCeilingEPP(t, "\n    maxHoldSeconds: 3", "10s")
+	sent := time.Now()
+	held := e.sendHeldAndRouteBeta(t)
+
+	responses, err := fwkepp.StreamedRequest(t, held, nil, 2)
+	require.NoError(t, err)
+	require.Len(t, responses, 2, "alpha's request must be routed after maxHoldSeconds")
+	for _, resp := range responses {
+		assert.Nil(t, resp.GetImmediateResponse())
+	}
+	assert.GreaterOrEqual(t, time.Since(sent), time.Second)
 }

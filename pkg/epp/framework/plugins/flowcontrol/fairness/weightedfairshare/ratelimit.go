@@ -33,6 +33,11 @@ package weightedfairshare
 // The balance may go negative, so a request larger than the burst dispatches once the balance is
 // positive. Over time a flow dispatches its rate, exceeding it by at most the burst plus one
 // request.
+//
+// With MaxHoldSeconds set, a held request dispatches once it has waited that long, so a ceiling
+// delays requests and never causes one to expire in queue. The balance is then floored at
+// -Rate*MaxHoldSeconds: a request arriving at the floor waits at most MaxHoldSeconds for the
+// refill, and a sustained overload does not leave a debt that holds the flow after it ends.
 
 import (
 	"fmt"
@@ -95,6 +100,11 @@ type rateState struct {
 	samples       int
 }
 
+// debit subtracts cost from the balance, down to floor. Caller holds mu.
+func (s *rateState) debit(cost, floor float64) {
+	s.balance = math.Max(floor, s.balance-cost)
+}
+
 // refill brings the balance up to now and returns it. Caller holds mu.
 func (s *rateState) refill(now time.Time) float64 {
 	if elapsed := now.Sub(s.refilled).Seconds(); elapsed > 0 {
@@ -131,7 +141,8 @@ func (s *rateState) learn(bytes int, inputCost, outputCost float64) {
 	s.outCost += alpha * (outputCost - s.outCost)
 }
 
-// pendingCharge is an estimate charged at dispatch and not yet settled at end of stream.
+// pendingCharge is the part of a dispatch estimate debited from the balance, not yet settled at
+// end of stream.
 type pendingCharge struct {
 	amount float64
 	at     time.Time
@@ -188,6 +199,20 @@ func (p *weightedFairShare) rateAllows(id string, now time.Time) bool {
 	return balance > 0
 }
 
+// heldLongEnough reports whether a request enqueued at enqueued has waited MaxHoldSeconds.
+func (p *weightedFairShare) heldLongEnough(enqueued, now time.Time) bool {
+	return p.cfg.MaxHoldSeconds > 0 && now.Sub(enqueued).Seconds() >= p.cfg.MaxHoldSeconds
+}
+
+// balanceFloor is the lowest balance a debit can reach: -Rate*MaxHoldSeconds, or unbounded
+// without MaxHoldSeconds.
+func (p *weightedFairShare) balanceFloor(rate FlowRate) float64 {
+	if p.cfg.MaxHoldSeconds <= 0 {
+		return math.Inf(-1)
+	}
+	return -rate.Rate * p.cfg.MaxHoldSeconds
+}
+
 // chargeEstimate charges the expected cost of the request at the head of the picked queue. A
 // request picked again after a dispatch that did not go through is charged once.
 func (p *weightedFairShare) chargeEstimate(queue flowcontrol.FlowQueueAccessor, now time.Time) {
@@ -211,14 +236,16 @@ func (p *weightedFairShare) chargeEstimate(queue flowcontrol.FlowQueueAccessor, 
 	}
 
 	st.mu.Lock()
-	est := st.estimate(p.cfg, requestBytes(ir, fcReq.ByteSize()), maxOutputTokens(ir))
-	if _, loaded := p.pending.LoadOrStore(ir.RequestID, pendingCharge{amount: est, at: now}); loaded {
+	if _, loaded := p.pending.Load(ir.RequestID); loaded {
 		st.mu.Unlock()
 		return
 	}
-	st.refill(now)
-	st.balance -= est
+	est := st.estimate(p.cfg, requestBytes(ir, fcReq.ByteSize()), maxOutputTokens(ir))
+	before := st.refill(now)
+	st.debit(est, p.balanceFloor(st.rate))
 	balance := st.balance
+	// The floor can absorb part of the estimate; settling refunds only what was debited.
+	p.pending.Store(ir.RequestID, pendingCharge{amount: before - balance, at: now})
 	st.mu.Unlock()
 	setIDGauge(p.balanceGauge, id, balance)
 }
@@ -246,7 +273,7 @@ func (p *weightedFairShare) settleRate(
 	}
 	st.mu.Lock()
 	st.refill(now)
-	st.balance -= cost - charged
+	st.debit(cost-charged, p.balanceFloor(st.rate))
 	st.learn(requestBytes(request, 0), inputCost, outputCost)
 	balance := st.balance
 	st.mu.Unlock()
